@@ -33,8 +33,10 @@ class Apps(private val context: Context) {
     @Synchronized
     fun installed(): Map<String, TvApp> {
         val pm = context.packageManager
-        val query = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
-        val apps = pm.queryIntentActivities(query, 0)
+        val tvQuery = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
+        val appQuery = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        // TV apps first, so a TV app keeps its banner; then the phone-style apps of a car unit.
+        val apps = (pm.queryIntentActivities(tvQuery, 0) + pm.queryIntentActivities(appQuery, 0))
             .filter { it.activityInfo.packageName != context.packageName }
             .distinctBy { it.activityInfo.packageName }
             .map { ri ->
@@ -46,7 +48,7 @@ class Apps(private val context: Context) {
                     id = info.packageName,
                     label = ri.loadLabel(pm).toString(),
                     banner = banner?.toBitmap(320, 180)?.asImageBitmap(),
-                    icon = if (banner == null) ri.loadIcon(pm)?.toBitmap(96, 96)?.asImageBitmap() else null,
+                    icon = if (banner == null) ri.loadIcon(pm)?.toBitmap(128, 128)?.asImageBitmap() else null,
                     intent = Intent(Intent.ACTION_MAIN)
                         .addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER)
                         .setComponent(ComponentName(info.packageName, info.name))
@@ -63,7 +65,7 @@ class Apps(private val context: Context) {
             id = SETTINGS,
             label = "Settings",
             banner = listed?.banner ?: resolved?.loadBanner(pm)?.toBitmap(320, 180)?.asImageBitmap(),
-            icon = if (listed == null) resolved?.loadIcon(pm)?.toBitmap(96, 96)?.asImageBitmap() else listed.icon,
+            icon = if (listed == null) resolved?.loadIcon(pm)?.toBitmap(128, 128)?.asImageBitmap() else listed.icon,
             // A fresh task, so it opens at the top rather than on the screen last used.
             intent = settingsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
         )
@@ -79,6 +81,13 @@ class Apps(private val context: Context) {
         // None of the usual apps installed: start with the first few there are.
         if (defaults.size <= 1) return installed.keys.filter { it != SETTINGS }.take(6) + SETTINGS
         return defaults
+    }
+
+    /** The app chosen for a widget slot ("vpn", "kino"), if any. */
+    fun slot(name: String): String? = prefs.getString("slot_$name", null)
+
+    fun setSlot(name: String, id: String) {
+        prefs.edit().putString("slot_$name", id).apply()
     }
 
     fun saveDock(ids: List<String>) {

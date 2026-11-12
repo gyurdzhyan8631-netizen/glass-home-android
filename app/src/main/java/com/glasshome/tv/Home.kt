@@ -12,6 +12,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -82,6 +83,7 @@ import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.layout
@@ -122,6 +124,8 @@ private val GlassBorder = Color(0x1AFFFFFF)
 private val Text2 = Color(0xB8FFFFFF)
 private val Mint = Color(0xFFC4F4EF)
 private val TextShadow = Shadow(Color(0x59000000), Offset(0f, 2f), 22f)
+private val TileW = if (Config.CAR_MODE) 150.dp else 112.dp
+private val TileH = if (Config.CAR_MODE) 84.dp else 63.dp
 
 /** The phone website's address and password, for the + panel. */
 class Phone(val url: String?, val password: String?, val error: String?)
@@ -142,6 +146,11 @@ class HomeState(private val apps: Apps, private val service: PhotoService) {
     var quickSettings by mutableStateOf<List<TvApp>>(emptyList())
     /** The weather location panel, from the weather under the clock. */
     var weatherOpen by mutableStateOf(false)
+    /** Calendar permission, and the picker for the VPN and Kino widgets. */
+    var calendarGranted by mutableStateOf(false)
+    var requestCalendar: (() -> Unit)? = null
+    var pickSlot by mutableStateOf<String?>(null)
+    private var slotRevision by mutableIntStateOf(0)
     var focusedId by mutableStateOf<String?>(null)
     var focusedCenterX by mutableFloatStateOf(0f)
 
@@ -154,7 +163,20 @@ class HomeState(private val apps: Apps, private val service: PhotoService) {
     @Volatile var lastInput = SystemClock.uptimeMillis()
 
     val dock: List<TvApp> get() = dockIds.mapNotNull { installed[it] } + shortcuts
-    val overlayOpen: Boolean get() = menuFor != null || addOpen || settingsOpen || weatherOpen
+    val overlayOpen: Boolean get() = menuFor != null || addOpen || settingsOpen || weatherOpen || pickSlot != null
+
+    /** The app behind a widget slot: the one picked, else the first usual one that is installed. */
+    fun slotApp(slot: String): TvApp? {
+        if (slotRevision < 0) return null   // read, so a new choice redraws the widget
+        apps.slot(slot)?.let { id -> installed[id]?.let { return it } }
+        val usual = if (slot == "vpn") Config.vpnApps else Config.kinoApps
+        return usual.firstNotNullOfOrNull { installed[it] }
+    }
+
+    fun setSlot(slot: String, id: String) {
+        apps.setSlot(slot, id)
+        slotRevision++
+    }
 
     fun focus(id: String?) {
         focusTarget = id ?: dock.firstOrNull()?.id ?: PLUS
@@ -166,6 +188,7 @@ class HomeState(private val apps: Apps, private val service: PhotoService) {
         addOpen = false
         settingsOpen = false
         weatherOpen = false
+        pickSlot = null
         ambient = false
         lastInput = SystemClock.uptimeMillis()
         focus(dock.firstOrNull()?.id)
@@ -244,6 +267,9 @@ fun HomeScreen(state: HomeState, photos: PhotoLibrary, weather: WeatherSource, o
     var caption by remember { mutableStateOf("") }
     val chrome by animateFloatAsState(if (state.ambient) 0f else 1f, tween(900), label = "chrome")
     val night = rememberNight()
+    // The widgets need room: on a 16:9 TV the calendar shows only the month.
+    val widthDp = LocalContext.current.resources.displayMetrics.widthPixels / LocalDensity.current.density
+    val wide = widthDp >= 1200f
 
     // Back does nothing on the home screen; it only closes the menu and panel.
     BackHandler(enabled = !state.overlayOpen) {}
@@ -269,6 +295,8 @@ fun HomeScreen(state: HomeState, photos: PhotoLibrary, weather: WeatherSource, o
                 Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                Widgets(state, glass, wide, onLaunch)
+                Spacer(Modifier.height(14.dp))
                 Dock(state, glass, onLaunch)
                 FocusedLabel(state)
                 Spacer(Modifier.height(18.dp))
@@ -294,6 +322,7 @@ fun HomeScreen(state: HomeState, photos: PhotoLibrary, weather: WeatherSource, o
         if (state.addOpen) AddPanel(state, glass)
         if (state.settingsOpen) QuickSettingsPanel(state, glass, onLaunch)
         if (state.weatherOpen) WeatherPanel(state, weather, glass)
+        if (state.pickSlot != null) SlotPicker(state, glass)
     }
 }
 
@@ -382,7 +411,7 @@ private fun Backdrop(
     // blank screen: it made both Chromecasts less even, not more.)
     LaunchedEffect(active) {
         frame.longValue = SystemClock.uptimeMillis()
-        if (active) while (true) withFrameMillis { frame.longValue = it }
+        if (active && !Config.STATIC_BACKGROUND) while (true) withFrameMillis { frame.longValue = it }
     }
 
     Spacer(
@@ -444,7 +473,7 @@ private fun shading(size: Size, density: androidx.compose.ui.unit.Density): Imag
  */
 private fun DrawScope.place(s: Slide, imgW: Int, imgH: Int, now: Long, m: android.graphics.Matrix) {
     val life = (Config.PHOTO_INTERVAL_MS + Config.FADE_MS).toFloat()
-    val t = ((now - s.start) / life).coerceIn(0f, 1f)
+    val t = if (Config.STATIC_BACKGROUND) 0.5f else ((now - s.start) / life).coerceIn(0f, 1f)
     val scale = max(size.width / imgW, size.height / imgH) * (1f + (Config.KEN_BURNS_SCALE - 1f) * t)
     val extraX = imgW * scale - size.width
     val extraY = imgH * scale - size.height
@@ -487,8 +516,8 @@ private fun Modifier.glass(id: String, glass: MutableMap<String, GlassRect>, rad
     }
         .clip(shape)
         .background(tint)
-        .background(Brush.verticalGradient(0f to Color(0x0FFFFFFF), 0.4f to Color.Transparent))
-        .border(1.dp, GlassBorder, shape)
+        .background(Brush.verticalGradient(0f to Color(0x24FFFFFF), 0.45f to Color.Transparent))
+        .border(1.dp, Brush.linearGradient(listOf(Color(0x80FFFFFF), Color(0x14FFFFFF), Color(0x40FFFFFF))), shape)
 }
 
 // ---------- top: brand, clock, weather ----------
@@ -639,7 +668,11 @@ private fun Modifier.tvClick(onLongPress: (() -> Unit)? = null, onClick: () -> U
     // A timer rather than key repeats: not every remote (or adb) sends repeats.
     val press = remember { arrayOfNulls<Job>(1) } // the pending long press while OK is down here
     val fired = remember { BooleanArray(1) }
-    onKeyEvent { e ->
+    val tap by rememberUpdatedState(onClick)
+    // Touch: a tap clicks, a long press is the same as holding OK.
+    pointerInput(Unit) {
+        detectTapGestures(onLongPress = { longPress?.invoke() }, onTap = { tap() })
+    }.onKeyEvent { e ->
         val k = e.nativeKeyEvent
         if (k.keyCode !in SelectKeys) return@onKeyEvent false
         when (k.action) {
@@ -666,6 +699,12 @@ private fun Modifier.tvClick(onLongPress: (() -> Unit)? = null, onClick: () -> U
     }
 }
 
+/** Touch: a tap on the dimmed area behind a panel closes it. */
+private fun Modifier.scrim(onTap: () -> Unit): Modifier = pointerInput(Unit) { detectTapGestures { onTap() } }
+
+/** Touch: keeps taps on a panel from reaching the dimmed area behind it. */
+private fun Modifier.swallowTouch(): Modifier = pointerInput(Unit) { detectTapGestures { } }
+
 @Composable
 private fun Dock(state: HomeState, glass: MutableMap<String, GlassRect>, onLaunch: (TvApp) -> Unit) {
     fun requester(id: String) = state.requester(id)
@@ -687,7 +726,7 @@ private fun Dock(state: HomeState, glass: MutableMap<String, GlassRect>, onLaunc
     }
 
     val canFocus = !state.overlayOpen
-    Box(Modifier.widthIn(max = 864.dp).glass("dock", glass, 23.dp)) {
+    Box(Modifier.widthIn(max = if (Config.CAR_MODE) 1344.dp else 864.dp).glass("dock", glass, 26.dp)) {
         Row(
             Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 14.dp, vertical = 13.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -755,7 +794,7 @@ private fun AppTile(
                 Modifier.align(Alignment.Center).padding(6.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                if (app.icon != null) Image(app.icon, null, Modifier.size(26.dp))
+                if (app.icon != null) Image(app.icon, null, Modifier.size(if (Config.CAR_MODE) 36.dp else 26.dp))
                 else if (app.id == Apps.SETTINGS) Label("⚙", 20.sp)
                 Label(app.label, 11.sp, weight = FontWeight.SemiBold, align = TextAlign.Center, maxLines = 2)
             }
@@ -774,10 +813,10 @@ private fun Tile(
     var focused by remember { mutableStateOf(false) }
     var centerX by remember { mutableFloatStateOf(0f) }
     val scale by animateFloatAsState(if (focused) 1.1f else 1f, tween(160), label = "tile")
-    val shape = RoundedCornerShape(12.dp)
+    val shape = RoundedCornerShape(16.dp)
     Box(
         modifier
-            .size(112.dp, 63.dp)
+            .size(TileW, TileH)
             .onGloballyPositioned {
                 centerX = it.boundsInRoot().center.x
                 if (focused) onFocus(centerX) // follows the dock as it scrolls
@@ -849,10 +888,10 @@ private fun QuickSettingsPanel(state: HomeState, glass: MutableMap<String, Glass
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) { awaitFrame(); runCatching { first.requestFocus() } }
 
-    Box(Modifier.fillMaxSize().background(Color(0x40000000)).padding(horizontal = 48.dp, vertical = 27.dp)) {
+    Box(Modifier.fillMaxSize().background(Color(0x40000000)).scrim(close).padding(horizontal = 48.dp, vertical = 27.dp)) {
         Row(
             Modifier.align(Alignment.TopEnd).padding(top = 84.dp)
-                .glass("quick", glass, 32.dp, GlassStrong).padding(10.dp),
+                .glass("quick", glass, 32.dp, GlassStrong).swallowTouch().padding(10.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             state.quickSettings.forEachIndexed { i, item ->
@@ -949,11 +988,11 @@ private fun WeatherPanel(state: HomeState, source: WeatherSource, glass: Mutable
         }
     }
 
-    Box(Modifier.fillMaxSize().background(Color(0x40000000)).padding(horizontal = 48.dp, vertical = 27.dp)) {
+    Box(Modifier.fillMaxSize().background(Color(0x40000000)).scrim(close).padding(horizontal = 48.dp, vertical = 27.dp)) {
         Column(
             Modifier.align(Alignment.TopEnd).padding(top = 84.dp).width(300.dp)
                 // Nearly opaque: it sits over the forecast, which would show through.
-                .glass("weatherPanel", glass, 20.dp, Color(0xF51C1C1E)).padding(10.dp),
+                .glass("weatherPanel", glass, 20.dp, Color(0xF51C1C1E)).swallowTouch().padding(10.dp),
         ) {
             Label("Weather location", 15.sp, Modifier.padding(10.dp, 6.dp, 10.dp, 2.dp), weight = FontWeight.SemiBold)
             Label(place?.let { "Now: ${it.name}" } ?: "The weather is off.", 12.sp, Modifier.padding(horizontal = 10.dp), color = Text2)
@@ -1007,9 +1046,9 @@ private fun TileMenu(state: HomeState, app: TvApp, glass: MutableMap<String, Gla
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) { awaitFrame(); runCatching { first.requestFocus() } }
 
-    Box(Modifier.fillMaxSize().background(Color(0x59000000))) {
+    Box(Modifier.fillMaxSize().background(Color(0x59000000)).scrim(close)) {
         Column(
-            Modifier.align(Alignment.Center).width(260.dp).glass("menu", glass, 20.dp, GlassStrong).padding(10.dp),
+            Modifier.align(Alignment.Center).width(260.dp).glass("menu", glass, 20.dp, GlassStrong).swallowTouch().padding(10.dp),
         ) {
             Label(app.label, 15.sp, Modifier.padding(10.dp, 6.dp, 10.dp, 8.dp), weight = FontWeight.SemiBold)
             MenuItem("Move left", Modifier.focusRequester(first), enabled = state.canMove(app.id, -1)) {
@@ -1057,10 +1096,10 @@ private fun AddPanel(state: HomeState, glass: MutableMap<String, GlassRect>) {
     val choices = state.installed.values.filter { it.id !in state.dockIds }
     LaunchedEffect(Unit) { awaitFrame(); runCatching { first.requestFocus() } }
 
-    Box(Modifier.fillMaxSize().background(Color(0x66000000))) {
+    Box(Modifier.fillMaxSize().background(Color(0x66000000)).scrim(close)) {
         Column(
             Modifier.align(Alignment.Center).width(720.dp).height(470.dp)
-                .glass("add", glass, 26.dp, GlassStrong).padding(22.dp),
+                .glass("add", glass, 26.dp, GlassStrong).swallowTouch().padding(22.dp),
         ) {
             PhoneCard(state)
             Spacer(Modifier.height(18.dp))
@@ -1154,4 +1193,193 @@ private fun Label(
         maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
     )
+}
+
+
+// ---------- widgets: calendar, VPN, Kino ----------
+
+@Composable
+private fun Widgets(state: HomeState, glass: MutableMap<String, GlassRect>, wide: Boolean, onLaunch: (TvApp) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.Bottom,
+    ) {
+        CalendarWidget(state, glass, wide)
+        SlotWidget(state, glass, "vpn", "VPN", onLaunch)
+        SlotWidget(state, glass, "kino", "Кино", onLaunch)
+    }
+}
+
+/** This month, with today marked, and (on a wide screen) the next events of the TV's calendar. */
+@Composable
+private fun CalendarWidget(state: HomeState, glass: MutableMap<String, GlassRect>, wide: Boolean) {
+    val context = LocalContext.current
+    val locale = Locale.getDefault()
+    var today by remember { mutableStateOf(java.time.LocalDate.now()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            today = java.time.LocalDate.now()
+            delay(60_000)
+        }
+    }
+    var events by remember { mutableStateOf<List<CalendarEvents.Event>>(emptyList()) }
+    LaunchedEffect(state.calendarGranted) {
+        if (!state.calendarGranted) return@LaunchedEffect
+        while (true) {
+            events = withContext(Dispatchers.IO) { CalendarEvents.upcoming(context) }
+            delay(10 * 60_000L)
+        }
+    }
+    val month = java.time.YearMonth.from(today)
+    val shift = month.atDay(1).dayOfWeek.value - 1      // the week starts on Monday
+    val length = month.lengthOfMonth()
+    val weeks = (shift + length + 6) / 7
+    val title = month.month.getDisplayName(java.time.format.TextStyle.FULL_STANDALONE, locale)
+        .replaceFirstChar { it.uppercase() } + " " + month.year
+
+    Row(
+        Modifier
+            .tvClick { if (!state.calendarGranted) state.requestCalendar?.invoke() }
+            .glass("calendar", glass, 18.dp)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Column {
+            Label(title, 14.sp, weight = FontWeight.SemiBold)
+            Spacer(Modifier.height(4.dp))
+            Row {
+                for (d in 1..7) {
+                    Box(Modifier.size(26.dp, 16.dp), contentAlignment = Alignment.Center) {
+                        Label(java.time.DayOfWeek.of(d).getDisplayName(java.time.format.TextStyle.NARROW, locale), 9.sp, color = Text2)
+                    }
+                }
+            }
+            for (w in 0 until weeks) {
+                Row {
+                    for (c in 0..6) {
+                        val day = w * 7 + c - shift + 1
+                        Box(Modifier.size(26.dp, 19.dp), contentAlignment = Alignment.Center) {
+                            if (day in 1..length) {
+                                val isToday = day == today.dayOfMonth
+                                Box(
+                                    Modifier.size(19.dp).clip(CircleShape).background(if (isToday) Mint else Color.Transparent),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Label(
+                                        day.toString(), 11.sp,
+                                        color = if (isToday) Color(0xFF1C1C1E) else Color.White,
+                                        weight = if (isToday) FontWeight.Bold else FontWeight.Medium,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (wide) {
+            Column(Modifier.width(210.dp)) {
+                Label("События", 14.sp, weight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                when {
+                    !state.calendarGranted -> Label("Нажмите, чтобы разрешить доступ к календарю", 12.sp, color = Text2)
+                    events.isEmpty() -> Label("Ближайших событий нет", 12.sp, color = Text2)
+                    else -> events.forEach { e ->
+                        Label(eventTime(e, locale), 10.sp, color = Mint)
+                        Label(e.title.ifBlank { "Без названия" }, 13.sp, Modifier.padding(bottom = 5.dp), maxLines = 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun eventTime(e: CalendarEvents.Event, locale: Locale): String {
+    // An all-day event starts at midnight UTC, whatever the time zone.
+    val at = java.time.Instant.ofEpochMilli(e.begin).atZone(
+        if (e.allDay) java.time.ZoneOffset.UTC else java.time.ZoneId.systemDefault(),
+    )
+    return at.format(DateTimeFormatter.ofPattern(if (e.allDay) "d MMM" else "d MMM, HH:mm", locale))
+}
+
+/** A glass card that opens an app: tap to open it, hold (or tap when empty) to choose which. */
+@Composable
+private fun SlotWidget(
+    state: HomeState,
+    glass: MutableMap<String, GlassRect>,
+    slot: String,
+    title: String,
+    onLaunch: (TvApp) -> Unit,
+) {
+    val app = state.slotApp(slot)
+    val icon = app?.icon
+    val banner = app?.banner
+    var focused by remember { mutableStateOf(false) }
+    Column(
+        Modifier
+            .size(130.dp, 112.dp)
+            .focusProperties { canFocus = !state.overlayOpen }
+            .onFocusChanged { focused = it.isFocused }
+            .tvClick(onLongPress = { state.pickSlot = slot }) {
+                if (app != null) {
+                    onLaunch(app)
+                } else {
+                    state.pickSlot = slot
+                }
+            }
+            .focusable()
+            .border(2.dp, if (focused) Color(0xE6FFFFFF) else Color.Transparent, RoundedCornerShape(18.dp))
+            .glass("slot_$slot", glass, 18.dp)
+            .padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        when {
+            icon != null -> Image(icon, null, Modifier.size(44.dp))
+            banner != null -> Image(banner, null, Modifier.size(80.dp, 45.dp).clip(RoundedCornerShape(8.dp)), contentScale = ContentScale.Crop)
+            else -> Label("+", 30.sp, weight = FontWeight.Light)
+        }
+        Spacer(Modifier.height(4.dp))
+        Label(title, 14.sp, weight = FontWeight.SemiBold)
+        Label(app?.label ?: "Выбрать", 10.sp, color = Text2, maxLines = 1)
+    }
+}
+
+/** Every installed app, to choose the one a widget opens. */
+@Composable
+private fun SlotPicker(state: HomeState, glass: MutableMap<String, GlassRect>) {
+    val slot = state.pickSlot ?: return
+    val close = { state.pickSlot = null; state.focus(null) }
+    BackHandler { close() }
+    val first = remember { FocusRequester() }
+    val choices = state.installed.values.toList()
+    LaunchedEffect(Unit) { awaitFrame(); runCatching { first.requestFocus() } }
+
+    Box(Modifier.fillMaxSize().background(Color(0x66000000)).scrim(close)) {
+        Column(
+            Modifier.align(Alignment.Center).width(720.dp).height(420.dp)
+                .glass("pick", glass, 26.dp, GlassStrong).swallowTouch().padding(22.dp),
+        ) {
+            Label(if (slot == "vpn") "Приложение для VPN" else "Приложение для кино", 18.sp, weight = FontWeight.SemiBold)
+            Spacer(Modifier.height(10.dp))
+            LazyVerticalGrid(
+                GridCells.Fixed(5),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+            ) {
+                items(choices, key = { it.id }) { app ->
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        AppTile(
+                            app,
+                            if (app == choices.first()) Modifier.focusRequester(first) else Modifier,
+                            onClick = { state.setSlot(slot, app.id); state.pickSlot = null; state.focus(null) },
+                        )
+                        Label(app.label, 10.sp, Modifier.padding(top = 6.dp), color = Text2, maxLines = 1)
+                    }
+                }
+            }
+        }
+    }
 }

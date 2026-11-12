@@ -1,13 +1,21 @@
 package com.glasshome.tv
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import com.glasshome.tv.web.PhotoService
@@ -22,6 +30,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var photos: PhotoLibrary
     private lateinit var service: PhotoService
     private var wakingKey = -1
+    private var wakingTouch = false
+    private val calendarPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        state.calendarGranted = it
+    }
     private var loading: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -32,8 +44,16 @@ class MainActivity : ComponentActivity() {
         state.quickSettings = QuickSettings.items(packageManager)
         photos = PhotoLibrary(this)
         val weather = WeatherSource(this, Config.weather)
+        state.calendarGranted = hasCalendarPermission()
+        state.requestCalendar = { calendarPermission.launch(Manifest.permission.READ_CALENDAR) }
         setContent {
-            HomeScreen(state, photos, weather, ::launch)
+            // The layout is drawn for a 960 x 540 dp screen and scaled to fit this one,
+            // so a wide, short car screen (1920 x 720, say) gets the same layout, wider.
+            val dm = resources.displayMetrics
+            val fit = minOf(dm.widthPixels / 960f, dm.heightPixels / 540f)
+            CompositionLocalProvider(LocalDensity provides Density(fit)) {
+                HomeScreen(state, photos, weather, ::launch)
+            }
         }
         // The photos cover the whole screen: drawing the black window behind them
         // too would be one more full-screen layer for the GPU every frame.
@@ -43,6 +63,9 @@ class MainActivity : ComponentActivity() {
             service.revision.collectLatest { refreshPhone() }
         }
     }
+
+    private fun hasCalendarPermission() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
 
     private suspend fun refreshPhone() {
         val tv = withContext(Dispatchers.IO) { service.tvState() }
@@ -58,6 +81,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         state.resumed = true
+        state.calendarGranted = hasCalendarPermission()
         state.lastInput = SystemClock.uptimeMillis()
         // Back from an app that was opened without a key press here (a remote's
         // Netflix button, a cast): show the dock, not the screensaver.
@@ -98,6 +122,21 @@ class MainActivity : ComponentActivity() {
             return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    // Touch counts as input too, and a touch on the screensaver only wakes it.
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        state.lastInput = SystemClock.uptimeMillis()
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN && state.ambient) {
+            state.ambient = false
+            wakingTouch = true
+            return true
+        }
+        if (wakingTouch) {
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) wakingTouch = false
+            return true
+        }
+        return super.dispatchTouchEvent(ev)
     }
 
     private fun launch(app: TvApp) {
